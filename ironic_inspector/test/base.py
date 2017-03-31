@@ -80,7 +80,7 @@ class BaseTest(test_base.BaseTestCase):
             return call[0][0]
 
         actual = sum(map(_get_patch_param, mock_call.call_args_list), [])
-        self.assertPatchEqual(actual, expected)
+        self.assertPatchEqual(expected, actual)
 
 
 class InventoryTest(BaseTest):

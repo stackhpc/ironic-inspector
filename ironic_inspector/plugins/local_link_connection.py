@@ -13,7 +13,9 @@
 
 """Generic LLDP Processing Hook"""
 
+import abc
 import binascii
+import six
 
 from ironicclient import exc as client_exc
 import netaddr
@@ -30,6 +32,7 @@ LOG = utils.getProcessingLogger(__name__)
 # http://standards.ieee.org/getieee802/download/802.1AB-2009.pdf
 LLDP_TLV_TYPE_CHASSIS_ID = 1
 LLDP_TLV_TYPE_PORT_ID = 2
+LLDP_TLV_TYPE_SYSTEM_NAME = 5
 PORT_ID_SUBTYPE_MAC = 3
 PORT_ID_SUBTYPE_IFNAME = 5
 PORT_ID_SUBTYPE_LOCAL = 7
@@ -41,14 +44,26 @@ CONF = cfg.CONF
 REQUIRED_IRONIC_VERSION = '1.19'
 
 
-class GenericLocalLinkConnectionHook(base.ProcessingHook):
-    """Process mandatory LLDP packet fields
+@six.add_metaclass(abc.ABCMeta)
+class BaseLocalLinkConnectionHook(base.ProcessingHook):
+    """Base for plugins that update local link connection info based on LLDP.
 
-    Non-vendor specific LLDP packet fields processed for each NIC found for a
-    baremetal node, port ID and chassis ID. These fields if found and if valid
-    will be saved into the local link connection info port id and switch id
-    fields on the Ironic port that represents that NIC.
+    Subclasses should implement the parse_tlv method in order to parse specific
+    TLVs they are interested in.
     """
+
+    @abc.abstractmethod
+    def parse_tlv(self, tlv_type, data):
+        """Parse an LLDP TLV and return a local link connection update.
+
+        This method should be implemented by subclasses to parse specific TLVs.
+
+        :param tlv_type: LLDP TLV type field.
+        :param data: unhexlified LLDP TLV value field.
+        :returns: a 2-tuple containing the name and value of a field in
+                  the port's local_link_connection attribute to update,
+                  or None.
+        """
 
     def _get_local_link_patch(self, tlv_type, tlv_value, port):
         try:
@@ -60,25 +75,10 @@ class GenericLocalLinkConnectionHook(base.ProcessingHook):
                             "inspector"), tlv_type)
             return
 
-        item = value = None
-        if tlv_type == LLDP_TLV_TYPE_PORT_ID:
-            # Check to ensure the port id is an allowed type
-            item = "port_id"
-            if data[0] in STRING_PORT_SUBTYPES:
-                value = data[1:].decode()
-            if data[0] == PORT_ID_SUBTYPE_MAC:
-                value = str(netaddr.EUI(
-                    binascii.hexlify(data[1:]).decode(),
-                    dialect=netaddr.mac_unix_expanded))
-        elif tlv_type == LLDP_TLV_TYPE_CHASSIS_ID:
-            # Check to ensure the chassis id is the allowed type
-            if data[0] == CHASSIS_ID_SUBTYPE_MAC:
-                item = "switch_id"
-                value = str(netaddr.EUI(
-                    binascii.hexlify(data[1:]).decode(),
-                    dialect=netaddr.mac_unix_expanded))
+        result = self.parse_tlv(tlv_type, data)
 
-        if item and value:
+        if result:
+            item, value = result
             if (not CONF.processing.overwrite_existing and
                     item in port.local_link_connection):
                 return
@@ -132,3 +132,68 @@ class GenericLocalLinkConnectionHook(base.ProcessingHook):
                 # because Ironic version is not going to change for the other
                 # interfaces.
                 break
+
+
+class GenericLocalLinkConnectionHook(BaseLocalLinkConnectionHook):
+    """Process mandatory LLDP packet fields
+
+    Non-vendor specific LLDP packet fields processed for each NIC found for a
+    baremetal node, port ID and chassis ID. These fields if found and if valid
+    will be saved into the local link connection info port id and switch id
+    fields on the Ironic port that represents that NIC.
+    """
+
+    def parse_tlv(self, tlv_type, data):
+        """Parse an LLDP TLV and return a local link connection update.
+
+        :param tlv_type: LLDP TLV type field.
+        :param data: unhexlified LLDP TLV value field.
+        :returns: a 2-tuple containing the name and value of a field in
+                  the port's local_link_connection attribute to update,
+                  or None.
+        """
+        if tlv_type == LLDP_TLV_TYPE_PORT_ID:
+            # Check to ensure the port id is an allowed type
+            value = None
+            if data[0] in STRING_PORT_SUBTYPES:
+                value = data[1:].decode()
+            if data[0] == PORT_ID_SUBTYPE_MAC:
+                value = str(netaddr.EUI(
+                    binascii.hexlify(data[1:]).decode(),
+                    dialect=netaddr.mac_unix_expanded))
+            if value:
+                return "port_id", value
+        elif tlv_type == LLDP_TLV_TYPE_CHASSIS_ID:
+            # Check to ensure the chassis id is the allowed type
+            if data[0] == CHASSIS_ID_SUBTYPE_MAC:
+                value = str(netaddr.EUI(
+                    binascii.hexlify(data[1:]).decode(),
+                    dialect=netaddr.mac_unix_expanded))
+                return "switch_id", value
+
+
+class SystemNameLocalLinkConnectionHook(BaseLocalLinkConnectionHook):
+    """Process the system name LLDP packet field and set as switch_info.
+
+    Some Neutron drivers expect the switch_info field in a port's
+    local_link_connection attribute to contain the system name of a switch.
+    This plugin will store the system name received via LLDP (if present) in
+    the switch_info field of the Ironic port's local_link_connection attribute.
+
+    It should be noted that some Neutron mechanism drivers expect switch_info
+    to contain something other than the system name, in which case this plugin
+    should not be used.
+    """
+
+    def parse_tlv(self, tlv_type, data):
+        """Parse an LLDP TLV and return a local link connection update.
+
+        :param tlv_type: LLDP TLV type field.
+        :param data: unhexlified LLDP TLV value field.
+        :returns: a 2-tuple containing the name and value of a field in
+                  the port's local_link_connection attribute to update,
+                  or None.
+        """
+        if tlv_type == LLDP_TLV_TYPE_SYSTEM_NAME:
+            value = data.decode()
+            return "switch_info", value
